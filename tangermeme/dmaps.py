@@ -37,7 +37,7 @@ def calculate_saliency_map(
 
 def dependency_map(
         model: nn.Module,
-        sequence: str
+        sequence: str | torch.Tensor
 ) -> np.ndarray:
     
     
@@ -47,7 +47,11 @@ def dependency_map(
     DNA_ALPHABET = 'ACGT'
     DNA_TO_INT = {char: i for i, char in enumerate(DNA_ALPHABET)}
 
-    original_input = one_hot_encode(sequence)
+    if type(sequence) == str:
+        original_input = one_hot_encode(sequence)
+    else:
+        original_input = sequence.clone()
+
     base_saliency = calculate_saliency_map(model, original_input.clone(), device=device)
 
     dependency_map = np.zeros((seq_len, seq_len))
