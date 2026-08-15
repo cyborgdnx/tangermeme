@@ -12,6 +12,15 @@ def calculate_saliency_map(
     ) -> np.ndarray:
     """
     Calculates the saliency map (gradient of output w.r.t. input) for a given input.
+
+    Args:
+        model (nn.Module): The pytorch model used to create the saliency map.
+        input (torch.Tensor): The input tensor for which the saliency map is calculated.
+        device: Device on which the model and input tensors are processed.
+
+    Returns:
+        np.ndarray: Saliency map representing the importance of each input
+            feature for the model's prediction.
     """
     model.eval()
     model.to(device)
@@ -41,6 +50,17 @@ def dependency_map(
         sequence: str | torch.Tensor,
         device
 ) -> np.ndarray:
+    """
+    Generates the dependency map for a given sequence using a model
+
+    Args:
+        model (nn.Module): The PyTorch model used to compute the dependency map.
+        sequence (str | nn.Tensor): The input sequence used to calculate the dependency map. The input tensor can be either a string or a tensor.
+        device (torch.device): Device on which the model and input tensors are processed.
+
+    Returns:
+        np.ndarray: Dependency map representing the dependencies between elements of the input sequence
+    """
 
     DNA_ALPHABET = 'ACGT'
     DNA_TO_INT = {char: i for i, char in enumerate(DNA_ALPHABET)}
