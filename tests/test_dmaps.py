@@ -1,12 +1,9 @@
-# test_dmaps.py
-# Contact: Tanmay Debnath <tanmaydebnath.tut.jp@gmail.com>
-
 import torch
 torch.use_deterministic_algorithms(True, warn_only=True)
 torch.manual_seed(0)
 
 
-import numpy as np
+import numpy
 import pytest
 
 from tangermeme.utils import one_hot_encode
@@ -17,6 +14,7 @@ from tangermeme.dmaps import dependency_map
 
 from .toy_models import FlattenDense
 from .toy_models import ConvAvgDense
+from .toy_models import ConvDense
 
 from numpy.testing import assert_array_almost_equal
 from numpy.testing import assert_array_equal
@@ -45,6 +43,11 @@ def X0():
 	return random_one_hot((1, 4, 10), random_state=0).float()
 
 
+@pytest.fixture
+def X():
+	return random_one_hot((8, 4, 10), random_state=0).float()
+
+
 ###
 # calculate_saliency_map
 ###
@@ -54,26 +57,47 @@ def test_calculate_saliency_map_shape(X0, device):
 	model = FlattenDense(seq_len=10, n_outputs=1)
 	sal = calculate_saliency_map(model, X0.clone(), device=device)
 
-	assert isinstance(sal, np.ndarray)
-	assert sal.shape == (10,)
+	assert isinstance(sal, torch.Tensor)
+	assert sal.shape == (1, 10)
 
 
-def test_calculate_saliency_map_non_negative(X0, device):
+def test_calculate_saliency_map_batch_shape(X, device):
+	model = FlattenDense(seq_len=10, n_outputs=1)
+	sal = calculate_saliency_map(model, X.clone(), device=device)
+
+	assert isinstance(sal, torch.Tensor)
+	assert sal.shape == (8, 10)
+
+
+def test_calculate_saliency_map_non_negative(X, device):
 	# The map is built from the absolute value of the gradient, so it can
 	# never be negative regardless of the sign of the underlying gradient.
 	torch.manual_seed(0)
 	model = ConvAvgDense(n_outputs=1)
-	sal = calculate_saliency_map(model, X0.clone(), device=device)
+	sal = calculate_saliency_map(model, X.clone(), device=device)
 
-	assert np.all(sal >= 0)
+	assert torch.all(sal >= 0)
 
 
-def test_calculate_saliency_map_does_not_mutate_input_values(X0, device):
+def test_calculate_saliency_map_does_not_mutate_input_values(X, device):
 	model = FlattenDense(seq_len=10, n_outputs=1)
-	X_before = X0.clone()
+	X_before = X.clone()
 
-	calculate_saliency_map(model, X0.clone(), device=device)
-	assert_array_equal(X0, X_before)
+	calculate_saliency_map(model, X.clone(), device=device)
+	assert_array_equal(X.numpy(), X_before.numpy())
+
+
+def test_calculate_saliency_map_accepts_int8_input(device):
+	# Unlike the original implementation, the dtype used for the forward /
+	# backward pass is resolved internally (defaulting to the model's own
+	# parameter dtype), the same as `predict`, so a low-precision int8 input
+	# -- which cannot itself require grad -- must work without error.
+	model = FlattenDense(seq_len=6, n_outputs=1)
+	X = one_hot_encode('ACGTAC').unsqueeze(0)
+	assert X.dtype == torch.int8
+
+	sal = calculate_saliency_map(model, X, device=device)
+	assert sal.shape == (1, 6)
 
 
 def test_calculate_saliency_map_matches_closed_form_linear(device):
@@ -85,33 +109,35 @@ def test_calculate_saliency_map_matches_closed_form_linear(device):
 	model = FlattenDense(seq_len=seq_len, n_outputs=1)
 	model.eval()
 
-	X = random_one_hot((1, 4, seq_len), random_state=2).float()
+	X = random_one_hot((5, 4, seq_len), random_state=2).float()
 	sal = calculate_saliency_map(model, X.clone(), device=device)
 
 	W = model.dense.weight.detach().reshape(4, seq_len)
-	expected = (W.abs() * X[0]).sum(dim=0).numpy()
+	expected = (W.abs().unsqueeze(0) * X).sum(dim=1).numpy()
 
-	assert_array_almost_equal(sal, expected, 5)
+	assert_array_almost_equal(sal.numpy(), expected, 5)
 
 
 def test_calculate_saliency_map_matches_autograd_nonlinear(device):
 	# Ground-truth cross-check against a plain torch.autograd.grad call,
 	# independent of anything internal to dmaps.py. Uses a model with a
-	# nonlinearity (ReLU) so the gradient genuinely depends on X.
+	# nonlinearity (ReLU) so the gradient genuinely depends on X, and a
+	# batch of examples so that batched gradients are checked against their
+	# per-example equivalents.
 	torch.manual_seed(3)
 	model = ConvAvgDense(n_outputs=1)
 	model.eval()
 
-	X = random_one_hot((1, 4, 15), random_state=4).float()
+	X = random_one_hot((6, 4, 15), random_state=4).float()
 	sal = calculate_saliency_map(model, X.clone(), device=device)
 
 	Xg = X.clone().to(device).requires_grad_()
 	y = model.to(device)(Xg)
 	g, = torch.autograd.grad(y, Xg, grad_outputs=torch.ones_like(y))
-	expected = (g.detach().abs() * Xg.detach()).sum(dim=1).squeeze(0)
+	expected = (g.detach().abs() * Xg.detach()).sum(dim=1)
 	expected = expected.cpu().numpy()
 
-	assert_array_almost_equal(sal, expected, 5)
+	assert_array_almost_equal(sal.numpy(), expected, 5)
 
 
 def test_calculate_saliency_map_zero_column_gives_zero_saliency(device):
@@ -123,28 +149,79 @@ def test_calculate_saliency_map_zero_column_gives_zero_saliency(device):
 	X[0, :, 5] = 0
 
 	sal = calculate_saliency_map(model, X.clone(), device=device)
-	assert sal[5] == 0
+	assert sal[0, 5] == 0
 
 
-def test_calculate_saliency_map_rejects_non_floating_input(device):
-	# one_hot_encode returns an int8 tensor; requires_grad_() only works on
-	# floating-point tensors, so an un-cast one-hot input must fail loudly
-	# rather than silently produce garbage.
-	model = FlattenDense(seq_len=6, n_outputs=1)
-	X = one_hot_encode('ACGTAC').unsqueeze(0)
+def test_calculate_saliency_map_batching_is_batch_size_invariant(X, device):
+	# The result for each example must not depend on which other examples
+	# happen to share its batch -- this is the assumption the whole
+	# per-example-gradient batching strategy rests on.
+	torch.manual_seed(0)
+	model = ConvAvgDense(n_outputs=1)
 
-	with pytest.raises(RuntimeError, match="floating point"):
+	sal_bs1 = calculate_saliency_map(model, X.clone(), batch_size=1,
+		device=device)
+	sal_bs3 = calculate_saliency_map(model, X.clone(), batch_size=3,
+		device=device)
+	sal_full = calculate_saliency_map(model, X.clone(), batch_size=64,
+		device=device)
+
+	assert_array_almost_equal(sal_bs1.numpy(), sal_bs3.numpy(), 5)
+	assert_array_almost_equal(sal_bs1.numpy(), sal_full.numpy(), 5)
+
+
+def test_calculate_saliency_map_target_selects_output(device):
+	torch.manual_seed(0)
+	model = FlattenDense(seq_len=10, n_outputs=3)
+	X = random_one_hot((4, 4, 10), random_state=0).float()
+
+	sal0 = calculate_saliency_map(model, X.clone(), target=0, device=device)
+	sal1 = calculate_saliency_map(model, X.clone(), target=1, device=device)
+
+	assert not torch.allclose(sal0, sal1)
+
+
+def test_calculate_saliency_map_args_are_used(device):
+	# FlattenDense.forward(X, alpha=0, beta=1) scales the (linear) output by
+	# beta, which scales the gradient -- and so the saliency map -- by the
+	# same constant factor.
+	torch.manual_seed(0)
+	model = FlattenDense(seq_len=10, n_outputs=1)
+	X = random_one_hot((3, 4, 10), random_state=0).float()
+	alpha = torch.zeros(3, 1)
+	beta = torch.full((3, 1), 2.0)
+
+	sal = calculate_saliency_map(model, X.clone(), args=[alpha, beta],
+		device=device)
+	sal_default = calculate_saliency_map(model, X.clone(), device=device)
+
+	assert_array_almost_equal(sal.numpy(), (sal_default * 2).numpy(), 4)
+
+
+def test_calculate_saliency_map_rejects_mismatched_args(device):
+	model = FlattenDense(seq_len=10, n_outputs=1)
+	X = random_one_hot((3, 4, 10), random_state=0).float()
+
+	with pytest.raises(ValueError, match="same first"):
+		calculate_saliency_map(model, X, args=[torch.zeros(2)], device=device)
+
+
+def test_calculate_saliency_map_rejects_multi_output_model(device):
+	# ConvDense returns a tuple of two tensors; calculate_saliency_map only
+	# supports models with a single tensor output, the same constraint
+	# `deep_lift_shap` documents.
+	model = ConvDense(n_outputs=1)
+	X = random_one_hot((2, 4, 100), random_state=0).float()
+
+	with pytest.raises(ValueError, match="single tensor"):
 		calculate_saliency_map(model, X, device=device)
 
 
-def test_calculate_saliency_map_rejects_batch_size_greater_than_one(device):
-	# The backward() call is hardcoded for a single-example, single-output
-	# prediction; a batch of more than one example must fail rather than
-	# silently return a saliency map for the wrong example.
+def test_calculate_saliency_map_rejects_empty_batch(device):
 	model = FlattenDense(seq_len=10, n_outputs=1)
-	X = random_one_hot((2, 4, 10), random_state=0).float()
+	X = random_one_hot((0, 4, 10), random_state=0).float()
 
-	with pytest.raises(RuntimeError):
+	with pytest.raises(ValueError, match="at least one example"):
 		calculate_saliency_map(model, X, device=device)
 
 
@@ -159,8 +236,8 @@ def test_dependency_map_shape_string_input(device):
 	model = FlattenDense(seq_len=len(seq), n_outputs=1)
 
 	dm = dependency_map(model, seq, device=device)
-	assert isinstance(dm, np.ndarray)
-	assert dm.shape == (len(seq), len(seq))
+	assert isinstance(dm, torch.Tensor)
+	assert dm.shape == (1, len(seq), len(seq))
 
 
 def test_dependency_map_shape_tensor_input(device):
@@ -169,8 +246,18 @@ def test_dependency_map_shape_tensor_input(device):
 	X = random_one_hot((1, 4, 10), random_state=0).float()
 
 	dm = dependency_map(model, X, device=device)
-	assert isinstance(dm, np.ndarray)
-	assert dm.shape == (10, 10)
+	assert isinstance(dm, torch.Tensor)
+	assert dm.shape == (1, 10, 10)
+
+
+def test_dependency_map_shape_batch_tensor_input(device):
+	torch.manual_seed(0)
+	model = FlattenDense(seq_len=10, n_outputs=1)
+	X = random_one_hot((5, 4, 10), random_state=0).float()
+
+	dm = dependency_map(model, X, device=device)
+	assert isinstance(dm, torch.Tensor)
+	assert dm.shape == (5, 10, 10)
 
 
 def test_dependency_map_string_and_tensor_inputs_agree(device):
@@ -185,7 +272,22 @@ def test_dependency_map_string_and_tensor_inputs_agree(device):
 	X = one_hot_encode(seq).float().unsqueeze(0)
 	dm_tensor = dependency_map(model, X, device=device)
 
-	assert_array_almost_equal(dm_str, dm_tensor, 5)
+	assert_array_almost_equal(dm_str.numpy(), dm_tensor.numpy(), 5)
+
+
+def test_dependency_map_batch_matches_looping_one_at_a_time(device):
+	# Processing several sequences in one call must give the same result,
+	# per sequence, as calling dependency_map once per sequence -- batching
+	# across sequences is only a speed/memory optimization.
+	torch.manual_seed(0)
+	model = ConvAvgDense(n_outputs=1)
+	X = random_one_hot((4, 4, 10), random_state=0).float()
+
+	dm_batch = dependency_map(model, X.clone(), device=device)
+	dm_looped = torch.cat([dependency_map(model, X[i:i+1].clone(),
+		device=device) for i in range(X.shape[0])])
+
+	assert_array_almost_equal(dm_batch.numpy(), dm_looped.numpy(), 4)
 
 
 def test_dependency_map_non_negative(device):
@@ -194,7 +296,7 @@ def test_dependency_map_non_negative(device):
 	model = ConvAvgDense(n_outputs=1)
 
 	dm = dependency_map(model, seq, device=device)
-	assert np.all(dm >= 0)
+	assert torch.all(dm >= 0)
 
 
 def test_dependency_map_deterministic(device):
@@ -207,7 +309,7 @@ def test_dependency_map_deterministic(device):
 
 	dm1 = dependency_map(model, seq, device=device)
 	dm2 = dependency_map(model, seq, device=device)
-	assert_array_almost_equal(dm1, dm2, 8)
+	assert_array_almost_equal(dm1.numpy(), dm2.numpy(), 8)
 
 
 def test_dependency_map_length_one(device):
@@ -215,21 +317,22 @@ def test_dependency_map_length_one(device):
 	model = FlattenDense(seq_len=1, n_outputs=1)
 
 	dm = dependency_map(model, 'A', device=device)
-	assert dm.shape == (1, 1)
+	assert dm.shape == (1, 1, 1)
 
 
 def test_dependency_map_diagonal_only_for_linear_model(device):
 	# A model with no nonlinearity between layers has a constant Jacobian:
 	# the gradient at position j cannot depend on the base present at any
-	# other position i. So mutating position i can only ever change the
+	# other position i. So substituting position i can only ever change the
 	# saliency *at* position i -- the dependency map must be diagonal.
 	torch.manual_seed(0)
 	seq = 'ACGTACGTACGTACG'
 
 	for model in (FlattenDense(seq_len=len(seq), n_outputs=1), _LinearConv()):
-		dm = dependency_map(model, seq, device=device)
-		off_diagonal = dm - np.diag(np.diag(dm))
-		assert_array_almost_equal(off_diagonal, np.zeros_like(dm), 5)
+		dm = dependency_map(model, seq, device=device)[0]
+		off_diagonal = dm - torch.diag(torch.diag(dm))
+		assert_array_almost_equal(off_diagonal.numpy(),
+			numpy.zeros(dm.shape), 5)
 
 
 def test_dependency_map_captures_nonlinear_interactions(device):
@@ -240,70 +343,67 @@ def test_dependency_map_captures_nonlinear_interactions(device):
 	seq = 'ACGTACGTACGTACG'
 	model = ConvAvgDense(n_outputs=1)
 
-	dm = dependency_map(model, seq, device=device)
-	off_diagonal = dm - np.diag(np.diag(dm))
-	assert not np.allclose(off_diagonal, 0, atol=1e-6)
+	dm = dependency_map(model, seq, device=device)[0]
+	off_diagonal = dm - torch.diag(torch.diag(dm))
+	assert not numpy.allclose(off_diagonal.numpy(), 0, atol=1e-6)
 
 
 def test_dependency_map_matches_bruteforce(device):
 	# Full validation of the internal algorithm: for every position i, the
-	# column dependency_map[:, i] must equal the mean absolute difference,
-	# over every alternate base (A/C/G/T minus the original, plus an 'N'
-	# deletion), between the saliency map of the mutated sequence and that
-	# of the original sequence.
+	# column dependency_map[0, :, i] must equal the mean absolute difference,
+	# over every one of the 4 possible bases at position i (including the
+	# base already there, whose difference is exactly zero), between the
+	# saliency map of the substituted sequence and that of the original.
 	torch.manual_seed(0)
 	seq = 'ACGTAC'
 	model = FlattenDense(seq_len=len(seq), n_outputs=1)
 	model.eval()
 
-	dm = dependency_map(model, seq, device=device)
+	dm = dependency_map(model, seq, device=device)[0]
 
 	alphabet = 'ACGT'
 	X0 = one_hot_encode(seq).float().unsqueeze(0)
-	base_saliency = calculate_saliency_map(model, X0.clone(), device=device)
+	base_saliency = calculate_saliency_map(model, X0.clone(),
+		device=device)[0]
 
-	expected = np.zeros((len(seq), len(seq)))
-	for i, original_base in enumerate(seq):
+	expected = numpy.zeros((len(seq), len(seq)))
+	for i in range(len(seq)):
 		diffs = []
-		for mutant in ['A', 'T', 'C', 'G', 'N']:
-			if mutant == original_base:
-				continue
-
+		for base in alphabet:
 			X_mut = X0.clone()
 			X_mut[0, :, i] = 0
-			if mutant != 'N':
-				X_mut[0, alphabet.index(mutant), i] = 1
+			X_mut[0, alphabet.index(base), i] = 1
 
 			mutated_saliency = calculate_saliency_map(model, X_mut,
-				device=device)
-			diffs.append(np.abs(mutated_saliency - base_saliency))
+				device=device)[0]
+			diffs.append((mutated_saliency - base_saliency).abs().numpy())
 
-		expected[:, i] = np.mean(diffs, axis=0)
+		expected[:, i] = numpy.mean(diffs, axis=0)
 
-	assert_array_almost_equal(dm, expected, 4)
-
-
-def test_dependency_map_rejects_batch_size_greater_than_one():
-	# dependency_map operates on a single sequence at a time; passing a
-	# batch must fail with a clear error instead of silently mutating only
-	# the first example while reporting a shape that implies otherwise.
-	model = FlattenDense(seq_len=10, n_outputs=1)
-	X = random_one_hot((2, 4, 10), random_state=0).float()
-
-	with pytest.raises(ValueError, match="single"):
-		dependency_map(model, X, device='cpu')
+	assert_array_almost_equal(dm.numpy(), expected, 4)
 
 
-def test_dependency_map_verbose_progress_print(capsys):
-	# Sanity check on the print-based progress reporting: the completion
-	# message is always printed, and the periodic progress line fires once
-	# the loop passes a multiple of 50 positions.
+def test_dependency_map_args_are_used(device):
 	torch.manual_seed(0)
-	seq_len = 55
-	model = FlattenDense(seq_len=seq_len, n_outputs=1)
+	seq = 'ACGTAC'
+	model = FlattenDense(seq_len=len(seq), n_outputs=1)
 
-	dependency_map(model, 'A' * seq_len, device='cpu')
+	dm_default = dependency_map(model, seq, device=device)
+	dm_scaled = dependency_map(model, seq, args=[torch.zeros(1, 1),
+		torch.full((1, 1), 2.0)], device=device)
 
-	captured = capsys.readouterr()
-	assert 'Processing mutation at position 50/55' in captured.out
-	assert 'Dependency map generation complete.' in captured.out
+	assert_array_almost_equal(dm_scaled.numpy(), (dm_default * 2).numpy(), 4)
+
+
+def test_dependency_map_rejects_empty_batch(device):
+	model = FlattenDense(seq_len=10, n_outputs=1)
+	X = random_one_hot((0, 4, 10), random_state=0).float()
+
+	with pytest.raises(ValueError, match="at least one example"):
+		dependency_map(model, X, device=device)
+
+
+def test_dependency_map_verbose_does_not_error(device):
+	torch.manual_seed(0)
+	model = FlattenDense(seq_len=6, n_outputs=1)
+	dependency_map(model, 'ACGTAC', device=device, verbose=True)
