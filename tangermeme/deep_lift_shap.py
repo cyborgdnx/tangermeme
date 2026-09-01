@@ -111,6 +111,11 @@ def _clear_hooks(module):
 
 		del module.handles
 
+	# Delete detached input/output if exists, to prevent memory leak
+	for name in ("input", "output"):
+		if name in module.__dict__:
+			delattr(module, name)
+
 
 def _fp_hook(module, inputs): 
 	module.input = inputs[0].clone().detach()
