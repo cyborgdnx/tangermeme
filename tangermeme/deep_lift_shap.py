@@ -111,9 +111,12 @@ def _clear_hooks(module):
 
 		del module.handles
 
-	# Delete detached input/output if exists, to prevent memory leak
+	# Drop the activations cached by `_fp_hook` and `_f_hook`, which are as
+	# large as the activations themselves and would otherwise stay attached to
+	# the module for as long as the model is alive. Only tensors are removed,
+	# so a model carrying its own attribute named `input` or `output` keeps it.
 	for name in ("input", "output"):
-		if name in module.__dict__:
+		if isinstance(module.__dict__.get(name), torch.Tensor):
 			delattr(module, name)
 
 
