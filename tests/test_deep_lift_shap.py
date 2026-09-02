@@ -37,6 +37,7 @@ from .toy_models import DilatedConv
 from .toy_models import MultiActivation
 from .toy_models import DropoutConv
 from .toy_models import MultiInputMultiOutput
+from .toy_models import AttributeNameConv
 
 from numpy.testing import assert_raises
 from numpy.testing import assert_array_almost_equal
@@ -1865,3 +1866,46 @@ def test_deep_lift_shap_verbose(X, device):
 		random_state=0, verbose=True)
 
 	assert_array_almost_equal(X_quiet, X_loud)
+
+
+def test_deep_lift_shap_clears_hook_caches(X, device):
+	torch.manual_seed(0)
+	model = SmallDeepSEA()
+
+	deep_lift_shap(model, X[:2], n_shuffles=2, device=device, random_state=0)
+
+	# The forward hooks cache a detached copy of each non-linearity's input
+	# and output. Those copies are as large as the activations themselves, so
+	# leaving them attached pins that much memory for the life of the model.
+	for module in model.modules():
+		assert "input" not in module.__dict__
+		assert "output" not in module.__dict__
+
+
+def test_deep_lift_shap_clears_hook_caches_on_error(X, device):
+	torch.manual_seed(0)
+	model = SmallDeepSEA()
+
+	# `target` is out of range for a one-output model, so the attribution loop
+	# raises and unwinds through the `finally` block that clears the hooks.
+	assert_raises(IndexError, deep_lift_shap, model, X[:2], target=5,
+		n_shuffles=2, device=device, random_state=0)
+
+	for module in model.modules():
+		assert "input" not in module.__dict__
+		assert "output" not in module.__dict__
+
+
+def test_deep_lift_shap_preserves_user_attributes(X, device):
+	torch.manual_seed(0)
+	model = AttributeNameConv()
+
+	deep_lift_shap(model, X[:2], n_shuffles=2, device=device, random_state=0)
+
+	# Hooks are only registered on non-linearities, but the caches are cleared
+	# across every module, so attributes that merely share a name with them
+	# must survive the call.
+	assert model.input == "sequence"
+	assert model.output == 1
+	assert model.conv.input == "kernel"
+	assert model.conv.output == "logits"
